@@ -2,7 +2,7 @@ import SwiftUI
 import MarkdownUI
 
 @main
-struct MDPeeKApp: App {
+struct MDPeekApp: App {
     @State private var scale = ReadingScale()
 
     var body: some Scene {
@@ -38,11 +38,18 @@ struct MarkdownDocument: FileDocument {
     static var readableContentTypes: [UTType] { [.markdownDocument, .plainText] }
     var text: String
     init(configuration: ReadConfiguration) throws {
-        text = String(data: configuration.file.regularFileContents ?? Data(), encoding: .utf8) ?? ""
+        text = decodeMarkdown(configuration.file.regularFileContents ?? Data())
     }
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
         throw CocoaError(.fileWriteNoPermission)
     }
+}
+
+/// UTF-8 с удалённым BOM; некорректные байты заменяются, файл всё равно открывается.
+func decodeMarkdown(_ data: Data) -> String {
+    let bom: [UInt8] = [0xEF, 0xBB, 0xBF]
+    let bytes = data.starts(with: bom) ? data.dropFirst(3) : data[...]
+    return String(decoding: bytes, as: UTF8.self)
 }
 
 extension Notification.Name { static let reloadMarkdown = Notification.Name("MDPeekReloadMarkdown") }
@@ -83,7 +90,9 @@ struct ReaderView: View {
         watcher?.start()
     }
     private func reload() {
-        guard let url, let content = try? String(contentsOf: url, encoding: .utf8), content != document.text else { return }
+        guard let url, let data = try? Data(contentsOf: url) else { return }
+        let content = decodeMarkdown(data)
+        guard content != document.text else { return }
         document.text = content
     }
 }
