@@ -5,6 +5,11 @@ import MarkdownUI
 struct MDPeekApp: App {
     @State private var scale = ReadingScale()
 
+    init() {
+        // Переключение между файлами идёт через боковую панель, поэтому системные вкладки окна не нужны.
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
     var body: some Scene {
         DocumentGroup(viewing: MarkdownDocument.self) { configuration in
             ReaderView(document: configuration.document, url: configuration.fileURL, scale: scale)
@@ -60,40 +65,132 @@ extension Notification.Name { static let reloadMarkdown = Notification.Name("MDP
     func reset() { value = 1; UserDefaults.standard.set(value, forKey: "readingScale") }
 }
 
+/// Состояние окна: выбранный файл, его текст, дерево папки и наблюдение за изменениями.
+@MainActor final class ReaderModel: ObservableObject {
+    /// Путь файла, который показан сейчас. Меняется боковой панелью.
+    @Published var selection: String? {
+        didSet {
+            guard selection != oldValue else { return }
+            // Пустое выделение в списке не сбрасывает документ: заголовок и baseURL должны совпадать с показанным текстом.
+            guard selection != nil else { selection = oldValue; return }
+            select()
+        }
+    }
+    @Published var expanded: Set<String> = []
+    @Published private(set) var text: String
+    @Published private(set) var nodes: [FileNode] = []
+
+    let folderName: String
+    private let folderPath: String?
+    private var watcher: FileWatcher?
+    private var treeTask: Task<Void, Never>?
+    private var hasLoadedTree = false
+
+    init(text: String, fileURL: URL?) {
+        self.text = text
+        selection = fileURL?.path(percentEncoded: false)
+        folderPath = fileURL?.deletingLastPathComponent().path(percentEncoded: false)
+        folderName = fileURL?.deletingLastPathComponent().lastPathComponent ?? "Markdown"
+        loadTree()
+    }
+
+    var title: String {
+        selection.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Markdown"
+    }
+
+    var baseURL: URL? {
+        selection.map { URL(fileURLWithPath: $0).deletingLastPathComponent() }
+    }
+
+    func startWatching() { restartWatcher() }
+
+    func stopWatching() {
+        watcher?.stop()
+        watcher = nil
+    }
+
+    /// Перечитывает текущий файл и дерево папки.
+    func reload() {
+        loadTree()
+        reloadText()
+    }
+
+    private func select() {
+        guard let selection else { return }
+        text = readFile(selection) ?? "*The file could not be read.*"
+        restartWatcher()
+    }
+
+    private func reloadText() {
+        guard let selection, let content = readFile(selection), content != text else { return }
+        text = content
+    }
+
+    private func restartWatcher() {
+        stopWatching()
+        guard let selection else { return }
+        let watcher = FileWatcher(url: URL(fileURLWithPath: selection)) { [weak self] in self?.reloadText() }
+        watcher.start()
+        self.watcher = watcher
+    }
+
+    private func loadTree() {
+        guard let folderPath else { return }
+        treeTask?.cancel()
+        treeTask = Task {
+            let scanned = await Task.detached(priority: .utility) { FileTree.scan(directory: folderPath) }.value
+            guard !Task.isCancelled else { return }
+            nodes = scanned
+            // Папки верхнего уровня раскрываем только при первой загрузке, чтобы не сбивать выбор пользователя.
+            if !hasLoadedTree {
+                hasLoadedTree = true
+                expanded = Set(scanned.filter { $0.children != nil }.map(\.id))
+            }
+        }
+    }
+
+    private func readFile(_ path: String) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        return decodeMarkdown(data)
+    }
+}
+
 struct ReaderView: View {
-    @State var document: MarkdownDocument
-    let url: URL?
+    @StateObject private var model: ReaderModel
     @ObservedObject var scale: ReadingScale
-    @State private var watcher: FileWatcher?
+
+    init(document: MarkdownDocument, url: URL?, scale: ReadingScale) {
+        _model = StateObject(wrappedValue: ReaderModel(text: document.text, fileURL: url))
+        self.scale = scale
+    }
 
     var body: some View {
-        ScrollView {
-            Markdown(document.text, baseURL: url?.deletingLastPathComponent())
-                .markdownTheme(.reader)
-                .textSelection(.enabled)
-                .markdownTextStyle(\.text) { FontSize(17 * scale.value) }
-                .frame(maxWidth: 760, alignment: .leading)
-                .padding(.horizontal, 32)
-                .padding(.vertical, 44)
-                .frame(maxWidth: .infinity)
+        NavigationSplitView {
+            FileSidebar(
+                title: model.folderName,
+                nodes: model.nodes,
+                selection: $model.selection,
+                expanded: $model.expanded
+            )
+        } detail: {
+            ScrollView {
+                Markdown(model.text, baseURL: model.baseURL)
+                    .markdownTheme(.reader)
+                    .textSelection(.enabled)
+                    .markdownTextStyle(\.text) { FontSize(17 * scale.value) }
+                    .frame(maxWidth: 760, alignment: .leading)
+                    .padding(.horizontal, 32)
+                    .padding(.vertical, 44)
+                    .frame(maxWidth: .infinity)
+            }
+            // При смене файла новая прокрутка начинается сверху.
+            .id(model.selection)
+            .background(Color(nsColor: .textBackgroundColor))
+            .navigationTitle(model.title)
         }
-        .background(Color(nsColor: .textBackgroundColor))
-        .navigationTitle(url?.lastPathComponent ?? "Markdown")
-        .onAppear { beginWatching() }
-        .onDisappear { watcher?.stop(); watcher = nil }
-        .onReceive(NotificationCenter.default.publisher(for: .reloadMarkdown)) { _ in reload() }
-    }
-
-    private func beginWatching() {
-        guard let url else { return }
-        watcher = FileWatcher(url: url) { reload() }
-        watcher?.start()
-    }
-    private func reload() {
-        guard let url, let data = try? Data(contentsOf: url) else { return }
-        let content = decodeMarkdown(data)
-        guard content != document.text else { return }
-        document.text = content
+        .onAppear { model.startWatching() }
+        .onDisappear { model.stopWatching() }
+        .onReceive(NotificationCenter.default.publisher(for: .reloadMarkdown)) { _ in model.reload() }
     }
 }
 
